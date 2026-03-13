@@ -1,0 +1,15 @@
+{
+  "eval_dataset": "Anthropic/hh-rlhf test",
+  "num_samples": 500,
+  "device": "cuda",
+  "gpt2_medium": {
+    "params_M": 345,
+    "ppl": 26.89
+  },
+  "mor_198m": {
+    "params_M": 198,
+    "ppl": 43.21
+  },
+  "claim": "update_needed",
+  "note": "GPT-2 evaluated on plain text. MoR evaluated on chat-formatted text (native training format). Same content, different wrapping. MoR trained on HH-RLHF \u2014 home ground advantage applies."
+}
