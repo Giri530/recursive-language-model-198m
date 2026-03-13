@@ -1,89 +1,77 @@
-# Mixture of Recursion Language Model (198M)
+# Mixture of Recursion Language Model (MoR LM) — 198M
 
-> A novel language model architecture with perplexity-guided adaptive computation depth
+A 198M parameter conversational language model with **adaptive recursive computation** via self-supervised perplexity-based routing. Built from scratch — no pretrained base, no fine-tuning — trained on 150K conversational samples on a single Kaggle T4 GPU.
 
-[![HuggingFace](https://img.shields.io/badge/🤗%20HuggingFace-Model-yellow)](https://huggingface.co/Girinath11/recursive-language-model-198m)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange.svg)](https://pytorch.org)
+> **HuggingFace Model**: [`Girinath11/recursive-language-model-198m`](https://huggingface.co/Girinath11/recursive-language-model-198m)
 
 ---
 
-## 🏆 Result
+## What is Mixture of Recursion?
 
-| Model | Parameters | Perplexity |
-|-------|-----------|------------|
-| **MoR LM (This)** | **198M** | **15.37** ✅ |
-| GPT-2 Small | 117M | ~29 |
-| GPT-2 Medium | 345M | ~22 |
-| GPT-2 Large | 774M | ~18 |
+Standard transformers apply the same depth to every token — simple and complex inputs both go through all N layers. This wastes compute on easy inputs and under-processes hard ones.
 
-**Beats GPT-2 Medium at 57% of its parameter count.**
+MoR fixes this with **self-supervised perplexity-guided routing**: the model measures its own uncertainty at inference and allocates recursion steps accordingly.
+
+```
+High PPL (> 50)  →  Model struggling  →  5 recursive steps
+Mid  PPL (20–50) →  Uncertain         →  3 recursive steps
+Low  PPL (< 20)  →  Confident         →  1 recursive step
+```
+
+No manual labels. The router learns difficulty directly from the model's own perplexity signal during training.
 
 ---
 
-## 💡 The Idea
+## Architecture
 
-Traditional transformers apply the **same computation** to every input — simple and complex alike.
+| Component | Description | Params |
+|---|---|---|
+| Token Embedding | GPT-2 BPE vocab (50,260 tokens) | ~39M |
+| Base Transformer | 16 layers, RoPE, pre-norm | ~149M |
+| Perplexity Router | 2-layer MLP (768 → 384 → 3), self-supervised | ~1.2M |
+| Recursive Layer | Shared transformer block, reused 1/3/5× | ~7M |
+| **Total** | | **~198M** |
 
-This model is different:
+### NaN-Safe FP16 Training
 
+Standard `-inf` masking causes NaN during fp16 mixed-precision. MoR uses `-1e4` masking + pre-softmax clamping for completely stable training:
+
+```python
+scores = scores.clamp(min=-1e4, max=1e4)
+attn   = F.softmax(scores, dim=-1)
+attn   = torch.nan_to_num(attn, nan=0.0)
 ```
-Simple input   (PPL < 20)  →  1 recursion step   ⚡ fast
-Medium input   (PPL 20-50) →  3 recursion steps
-Complex input  (PPL > 50)  →  5 recursion steps  🧠 deep
-```
 
-The router learns difficulty **automatically** from the model's own perplexity — no manual labels needed.
+Result: **0 NaN batches** across all 150K training steps.
 
 ---
 
-## 🏗️ Architecture
+## Results
 
-```
-Input
-  │
-  ▼
-Token Embeddings (50,260 × 768)
-  │
-  ▼
-Base Transformer Stack (16 layers)
-  │   ├── Multi-Head Attention (RoPE)
-  │   ├── Feed-Forward (768 → 3072 → 768)
-  │   └── Pre-LayerNorm + Residual
-  │
-  ▼
-Perplexity Router
-  │   ├── Sequence pooling
-  │   ├── MLP classifier (768 → 384 → 3)
-  │   └── Outputs: simple / medium / complex
-  │
-  ▼
-Recursive Layer (applied 1, 3, or 5 times)
-  │
-  ▼
-Final LayerNorm → LM Head
-  │
-  ▼
-Output
-```
+### In-Distribution Validation (same conversational distribution as training)
 
-### Key Components
+| Epoch | Train Loss | Val Loss | Val PPL |
+|---|---|---|---|
+| 1 | 4.5081 | 3.0798 | 21.75 |
+| 2 | 3.3068 | 2.7326 | **15.37** |
 
-| Component | Details |
-|-----------|---------|
-| Embedding dim | 768 |
-| Layers | 16 |
-| Attention heads | 12 |
-| FFN size | 3072 |
-| Max seq length | 512 |
-| Positional encoding | RoPE |
-| Vocab size | 50,260 |
-| Total params | ~198M |
+### Out-of-Distribution Test (fresh HH-RLHF test samples, never seen during training)
+
+| Model | Params | Test PPL |
+|---|---|---|
+| GPT-2 Medium | 345M | 26.89 |
+| **MoR 198M** | **198M** | **43.21** |
+
+**Honest assessment:**
+
+- The 15.37 val PPL was measured on in-distribution data — do not compare it directly to GPT-2 Medium's standard benchmark numbers, they use different datasets
+- The generalization gap (val 15.37 → test 43.21) indicates overfitting to the training distribution
+- 150K samples is a small training set for a 198M model; more diverse data would help significantly
+- The architecture and routing mechanism are validated — training is stable, loss decreases, router signals are correct
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 pip install transformers torch
@@ -102,24 +90,29 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 
-model.eval()
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model = model.to(device)
+model  = model.to(device).eval()
+```
 
-def chat(question):
+The model was trained with a specific chat format — always wrap your input like this:
+
+```python
+def chat(question, max_new_tokens=150, temperature=0.7, top_p=0.9):
     prompt = f"<|user|>\n{question}\n<|assistant|>\n"
-    inputs = tokenizer(prompt, return_tensors="pt",
-                       add_special_tokens=False).to(device)
+
+    inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(device)
+
     with torch.no_grad():
         outputs = model.generate(
-            inputs['input_ids'],
-            max_new_tokens=150,
-            temperature=0.7,
-            top_p=0.9,
-            do_sample=True
+            inputs["input_ids"],
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=True,
         )
+
     full = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return full.split("<|assistant|>")[-1].strip()
+    return full.split("<|assistant|>")[-1].strip() if "<|assistant|>" in full else full
 
 print(chat("What is machine learning?"))
 print(chat("Explain neural networks simply"))
@@ -127,100 +120,105 @@ print(chat("Explain neural networks simply"))
 
 ---
 
-## 📚 Training
+## Training Details
 
-### Dataset — 150K samples
+### Dataset — 150K Conversational Samples
 
-| Source | Samples | Type |
-|--------|---------|------|
-| Anthropic HH-RLHF | 80,000 | Helpful conversations |
-| UltraChat | 50,000 | Multi-turn dialogues |
-| Alpaca-GPT4 | 20,000 | Instruction following |
+| Dataset | Samples | Share | Description |
+|---|---|---|---|
+| Anthropic HH-RLHF | 80,000 | 53% | Helpful & harmless human feedback |
+| UltraChat | 50,000 | 33% | GPT-4 multi-turn dialogues |
+| Alpaca-GPT4 | 20,000 | 14% | Instruction following |
 
 ### Config
 
-```yaml
-Epochs:          2
-Batch size:      2 × 32 = 64 effective
-Learning rate:   1e-4 (cosine decay)
-Warmup steps:    500
-Optimizer:       AdamW (β=0.9, 0.95)
-Mixed precision: fp16
-GPU:             Tesla T4 (Kaggle)
-Training time:   9h 12m
 ```
+GPU             : NVIDIA Tesla T4 (15.6 GB VRAM) — Kaggle, single GPU
+Epochs          : 2
+Total steps     : 150,000
+Training time   : ~9h 12m
 
-### Training Curve
+Batch size      : 2
+Grad accum      : 32  →  effective batch = 64
+Max seq len     : 512
+Learning rate   : 1e-4
+LR schedule     : Linear warmup (500 steps) + Cosine decay
+Optimizer       : AdamW  (β = 0.9, 0.95,  ε = 1e-8)
+Weight decay    : 0.01
+Grad clip       : 1.0
+Mixed precision : FP16 (AMP)
 
-| Epoch | Train Loss | Val Loss | Perplexity |
-|-------|-----------|----------|------------|
-| 1 | 4.5081 | 3.0798 | 21.75 |
-| 2 | 3.3068 | 2.7326 | **15.37** 🔥 |
+Loss            : LM loss + 0.1 × Router loss
+```
 
 ---
 
-## 💡 Technical Details
-
-### Perplexity-Based Routing (Novel)
+## Self-Supervised Perplexity Routing — How It Works
 
 ```python
-# Self-supervised pseudo labels during training
-sample_ppl = exp(sample_loss)
+# No manual labels — router trains on the model's own uncertainty
+sample_ppl = exp(per_sample_ce_loss)
 
-if sample_ppl < 20:   label = 0  # simple
-elif sample_ppl < 50: label = 1  # medium
-else:                 label = 2  # complex
+if sample_ppl < 20:   pseudo_label = 0  # simple
+elif sample_ppl < 50: pseudo_label = 1  # medium
+else:                 pseudo_label = 2  # complex
 
-total_loss = lm_loss + 0.1 * router_loss
+router_loss = CrossEntropyLoss(router_logits, pseudo_label)
+total_loss  = lm_loss + 0.1 * router_loss
 ```
 
-### NaN-Safe fp16 Attention
-
-```python
-# ❌ Unstable — causes NaN in fp16
-mask.fill_(float('-inf'))
-
-# ✅ Stable
-mask.fill_(-1e4)
-scores = scores.clamp(min=-1e4, max=1e4)
-attn = F.softmax(scores, dim=-1)
-attn = torch.nan_to_num(attn, nan=0.0)
-```
+As training progresses, more samples naturally fall into the "simple" bucket — an emergent curriculum with no annotation cost.
 
 ---
 
-## 📁 Structure
+## Limitations
 
-```
-── mixture_of_recursion.py   # Model architecture
-── README.md
-```
-
----
-
-## 🔗 Links
-
-- **HuggingFace Model:** [Girinath11/recursive-language-model-198m](https://huggingface.co/Girinath11/recursive-language-model-198m)
+- **Context**: 512 tokens max
+- **Language**: English only
+- **Generalization**: Overfits to conversational training distribution
+- **Repetition**: May loop on generations longer than ~200 tokens
+- **Factual accuracy**: Will hallucinate — not suitable for factual Q&A
 
 ---
 
-## 📄 Citation
+## Intended Use
+
+This model is intended for research and learning purposes.
+
+| Use case | Suitable? |
+|---|---|
+| Research on adaptive computation | Yes |
+| Learning how LLMs are built from scratch | Yes |
+| Prototyping conversational AI | With caveats |
+| Production chatbots | No |
+| Factual / medical / legal / financial use | No |
+---
+
+## Citation
 
 ```bibtex
-@misc{mor-lm-198m-2026,
-  author = {Girinath V},
-  title  = {Mixture of Recursion Language Model},
-  year   = {2026},
-  url    = {https://huggingface.co/Girinath11/recursive-language-model-198m}
+@misc{girinath2026mor,
+  author       = {Girinath V},
+  title        = {Mixture of Recursion: Self-Supervised Perplexity-Guided
+                  Adaptive Computation for Language Models},
+  year         = {2026},
+  publisher    = {Hugging Face},
+  howpublished = {\url{https://huggingface.co/Girinath11/recursive-language-model-198m}},
+  note         = {198M parameter LM trained from scratch with adaptive
+                  recursive computation via perplexity-based routing}
 }
 ```
 
 ---
 
-## 📜 License
+## Acknowledgments
 
-MIT License — Free to use with attribution
+- Anthropic — HH-RLHF dataset
+- Tsinghua University — UltraChat dataset
+- Vicgalle — Alpaca-GPT4 dataset
+- HuggingFace — Transformers library
+- Kaggle — Free GPU access
 
 ---
 
-*Built from scratch on a free Kaggle T4 GPU 🚀*
+**License**: MIT &nbsp;|&nbsp; **Status**: Research / Educational &nbsp;|&nbsp; **Last updated**: March 2026
